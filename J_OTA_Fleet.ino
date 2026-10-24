@@ -19,7 +19,7 @@
 #include "secrets.h"            
 
 #define FW_MAJOR 1
-#define FW_MINOR 0
+#define FW_MINOR 1
 #define FW_PATCH 0
 const uint32_t FW_VERSION = (FW_MAJOR << 16) | (FW_MINOR << 8) | FW_PATCH;
 
@@ -238,7 +238,7 @@ void displayTask(void* param) {
         oled.clearDisplay();
         oled.setTextSize(1);
         oled.setCursor(0, 0);
-        oled.printf("FleetForge v%d.%d.%d", FW_MAJOR, FW_MINOR, FW_PATCH);
+        oled.printf("FleetForge v%d.%d.%d NEW", FW_MAJOR, FW_MINOR, FW_PATCH);
         oled.drawLine(0, 10, 127, 10, SSD1306_WHITE);
 
         oled.setTextSize(2);
