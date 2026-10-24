@@ -1,5 +1,6 @@
 // Project J - OTA Server + Fleet Management (Team FleetForge)
-// Step 5: WiFiManager + secure MQTT (TLS) to EMQX Cloud
+// Step 7: Fleet version check - accept upgrades, reject downgrades
+// (Step 5 base: WiFiManager + secure MQTT (TLS) to EMQX Cloud)
 // Core 1: Sensor, Alarm, Display tasks   |   Core 0: Network task (WiFi + MQTT)
 
 #include <Arduino.h>
@@ -44,11 +45,15 @@ const uint32_t FW_VERSION = (FW_MAJOR << 16) | (FW_MINOR << 8) | FW_PATCH;
 // ois/fleetforge/node01/alert       sent when the alarm starts or stops
 // ois/fleetforge/node01/status      "online" / "offline" (retained + Last Will)
 // ois/fleetforge/node01/info        firmware, chip, IDF version (retained)
+// ois/fleetforge/node01/ota         result of each fleet version check
+// ois/fleetforge/fleet/firmware     <- we SUBSCRIBE: latest fleet version, e.g. "1.1.0" (retained)
 #define TOPIC_BASE      "ois/fleetforge/" NODE_ID
 #define TOPIC_TELEMETRY TOPIC_BASE "/telemetry"
 #define TOPIC_ALERT     TOPIC_BASE "/alert"
 #define TOPIC_STATUS    TOPIC_BASE "/status"
 #define TOPIC_INFO      TOPIC_BASE "/info"
+#define TOPIC_OTA       TOPIC_BASE "/ota"
+#define TOPIC_FLEET     "ois/fleetforge/fleet/firmware"
 
 // ─── EMQX CA CERTIFICATE (DigiCert Global Root G2, public, valid to 2038) ─
 static const char EMQX_CA_CERT[] PROGMEM = R"EOF(
@@ -92,6 +97,10 @@ SemaphoreHandle_t logMutex;
 volatile bool wifiOk = false; // written by Network task, read by Display task
 volatile bool mqttOk = false;
 
+// Fleet version state (written by Network task, read by Display/Alarm tasks)
+volatile bool     upgradePending = false;  // a newer version was announced
+volatile uint32_t targetVersion  = 0;      // that newer version, as a number
+
 RTC_DATA_ATTR uint32_t bootCount = 0;
 
 DHT dht(DHT_PIN, DHT11);
@@ -122,6 +131,29 @@ void setColor(bool r, bool g, bool b) {
     digitalWrite(LED_R, r);
     digitalWrite(LED_G, g);
     digitalWrite(LED_B, b);
+}
+
+// ─── VERSION HELPERS ─────────────────────────────────────────────────────
+// Version is stored as ONE number: (major << 16) | (minor << 8) | patch
+// 1.0.0 -> 65536   1.1.0 -> 65792   1.10.0 -> 68096   2.0.0 -> 131072
+// Comparing numbers is always correct. Comparing text is NOT:
+// as text "1.10.0" < "1.9.0" (because '1' < '9'), but as numbers 68096 > 67840.
+
+// Parse "1.2.3" or "v1.2.3" into a number. Returns false if the text is invalid.
+bool parseVersion(const char* text, uint32_t* out) {
+    if (text[0] == 'v' || text[0] == 'V') text++;
+    unsigned int major, minor, patch;
+    char extra;
+    // exactly three numbers, nothing after them
+    if (sscanf(text, "%u.%u.%u%c", &major, &minor, &patch, &extra) != 3) return false;
+    if (major > 255 || minor > 255 || patch > 255) return false;
+    *out = (major << 16) | (minor << 8) | patch;
+    return true;
+}
+
+// Turn the number back into "1.2.3" text
+void versionToText(uint32_t v, char* buf, size_t len) {
+    snprintf(buf, len, "%lu.%lu.%lu", (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -167,6 +199,8 @@ void alarmTask(void* param) {
             digitalWrite(BUZZER_PIN, BUZZER_ON);
             vTaskDelay(pdMS_TO_TICKS(150));
             digitalWrite(BUZZER_PIN, BUZZER_OFF);
+        } else if (upgradePending) {
+            setColor(1, 0, 1);                        // purple = update available
         } else {
             setColor(0, 1, 0);                        // green = normal
         }
@@ -203,8 +237,70 @@ void displayTask(void* param) {
         oled.setCursor(0, 47);
         oled.printf("WiFi:%s  MQTT:%s", wifiOk ? "OK" : "--", mqttOk ? "OK" : "--");
         oled.setCursor(0, 56);
-        oled.printf("Boot:%lu  %s", bootCount, data.alarm ? "ALARM!" : "OK");
+        if (data.alarm) {
+            oled.printf("Boot:%lu  ALARM!", bootCount);
+        } else if (upgradePending) {
+            char t[12];
+            versionToText(targetVersion, t, sizeof(t));
+            oled.printf("Update v%s ready", t);
+        } else {
+            oled.printf("Boot:%lu  OK", bootCount);
+        }
         oled.display();
+    }
+}
+
+// ─── FLEET VERSION CHECK ─────────────────────────────────────────────────
+// Publishes the result so the fleet manager can see what every node decided
+void publishOtaResult(const char* result, const char* announced) {
+    char cur[12];
+    versionToText(FW_VERSION, cur, sizeof(cur));
+    char msg[160];
+    snprintf(msg, sizeof(msg),
+             "{\"result\":\"%s\",\"current\":\"%s\",\"announced\":\"%s\",\"boot\":%lu}",
+             result, cur, announced, bootCount);
+    mqtt.publish(TOPIC_OTA, msg);
+}
+
+// Called by PubSubClient (inside mqtt.loop(), in the Network task)
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+    if (strcmp(topic, TOPIC_FLEET) != 0) return;
+
+    // Copy payload into a normal C string, trimming spaces/newlines
+    char text[24];
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < length && n < sizeof(text) - 1; i++) {
+        if (payload[i] != ' ' && payload[i] != '\r' && payload[i] != '\n') text[n++] = (char)payload[i];
+    }
+    text[n] = '\0';
+    if (n == 0) return;   // empty message (e.g. a retained message being cleared)
+
+    uint32_t announced;
+    if (!parseVersion(text, &announced)) {
+        LOG_ERROR("Fleet version '%s' is not valid (expected e.g. 1.1.0)", text);
+        publishOtaResult("invalid", text);
+        return;
+    }
+
+    char cur[12];
+    versionToText(FW_VERSION, cur, sizeof(cur));
+    LOG_INFO("Fleet version received: %s (%lu) | mine: %s (%lu)",
+             text, announced, cur, FW_VERSION);
+
+    if (announced > FW_VERSION) {
+        LOG_INFO("UPGRADE ACCEPTED: %s -> %s", cur, text);
+        upgradePending = true;
+        targetVersion  = announced;
+        publishOtaResult("upgrade_accepted", text);
+        // Step 8: open the OTA window here
+    } else if (announced == FW_VERSION) {
+        LOG_INFO("Already up to date (%s)", cur);
+        upgradePending = false;
+        publishOtaResult("up_to_date", text);
+    } else {
+        LOG_WARN("DOWNGRADE REJECTED: announced %s is older than %s", text, cur);
+        upgradePending = false;
+        publishOtaResult("downgrade_rejected", text);
     }
 }
 
@@ -230,6 +326,10 @@ bool mqttConnect() {
              FW_MAJOR, FW_MINOR, FW_PATCH, FW_VERSION,
              ESP.getChipModel(), esp_get_idf_version(), bootCount);
     mqtt.publish(TOPIC_INFO, info, true);
+
+    // Listen for the fleet version (retained, so we get it right after subscribing)
+    if (mqtt.subscribe(TOPIC_FLEET, 1)) LOG_INFO("Subscribed to %s", TOPIC_FLEET);
+    else                                LOG_ERROR("Subscribe failed: %s", TOPIC_FLEET);
 
     LOG_INFO("MQTT connected (TLS). Published status=online and device info");
     return true;
@@ -271,8 +371,10 @@ void networkTask(void* param) {
     LOG_INFO("WiFi connected: %s | IP %s | RSSI %d dBm",
              WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
 
-    tlsClient.setCACert(EMQX_CA_CERT);       
+    // ---- MQTT over TLS ----
+    tlsClient.setCACert(EMQX_CA_CERT);        // verify we really talk to EMQX
     mqtt.setServer(MQTT_HOST, MQTT_PORT);
+    mqtt.setCallback(onMqttMessage);
     mqtt.setBufferSize(512);
     mqtt.setKeepAlive(30);
 
@@ -305,6 +407,7 @@ void networkTask(void* param) {
             mqtt.loop();                      // keeps the connection alive
         }
 
+        // Take the newest reading if there is one (don't wait)
         if (xQueueReceive(mqttQueue, &latest, 0) == pdTRUE) haveData = true;
 
         if (mqttOk && haveData) {
@@ -330,6 +433,7 @@ void networkTask(void* param) {
     }
 }
 
+// ═════════════════════════════════════════════════════════════════════════
 void setup() {
     Serial.begin(115200);
     delay(500);
@@ -361,6 +465,7 @@ void setup() {
 
     dht.begin();
 
+    // Unique MQTT client ID from the chip's MAC address
     uint64_t mac = ESP.getEfuseMac();
     snprintf(clientId, sizeof(clientId), "fleetforge-%04X%08lX",
              (uint16_t)(mac >> 32), (uint32_t)mac);
@@ -369,6 +474,7 @@ void setup() {
     displayQueue = xQueueCreate(1, sizeof(SensorData_t));
     mqttQueue    = xQueueCreate(1, sizeof(SensorData_t));
 
+    //                     function     name           stack  param prio handle core
     xTaskCreatePinnedToCore(sensorTask,  "SensorTask",   4096, NULL, 3, NULL, 1);
     xTaskCreatePinnedToCore(alarmTask,   "AlarmTask",    4096, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(displayTask, "DisplayTask",  4096, NULL, 1, NULL, 1);
