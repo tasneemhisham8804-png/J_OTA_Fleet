@@ -1,4 +1,5 @@
 // Project J - OTA Server + Fleet Management (Team FleetForge)
+// Step 8: OTA - an accepted upgrade opens a 2-minute ArduinoOTA window
 // Step 7: Fleet version check - accept upgrades, reject downgrades
 // (Step 5 base: WiFiManager + secure MQTT (TLS) to EMQX Cloud)
 // Core 1: Sensor, Alarm, Display tasks   |   Core 0: Network task (WiFi + MQTT)
@@ -12,10 +13,10 @@
 #include <WiFiManager.h>        // tzapu
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>       // Nick O'Leary
+#include <ArduinoOTA.h>         // comes with the ESP32 board package
 #include <stdarg.h>
-#include "secrets.h"            // MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS (never on GitHub)
+#include "secrets.h"            
 
-// ─── FIRMWARE VERSION ────────────────────────────────────────────────────
 #define FW_MAJOR 1
 #define FW_MINOR 0
 #define FW_PATCH 0
@@ -39,6 +40,8 @@ const uint32_t FW_VERSION = (FW_MAJOR << 16) | (FW_MINOR << 8) | FW_PATCH;
 #define READ_EVERY_MS    2000
 #define PUBLISH_EVERY_MS 10000          // send telemetry to the cloud every 10 s
 #define NODE_ID          "node01"
+#define OTA_WINDOW_MS    120000         // OTA window stays open 2 minutes
+#define OTA_HOSTNAME     "fleetforge-" NODE_ID
 
 // ─── MQTT TOPICS ─────────────────────────────────────────────────────────
 // ois/fleetforge/node01/telemetry   temperature, humidity, boot count ...
@@ -100,6 +103,13 @@ volatile bool mqttOk = false;
 // Fleet version state (written by Network task, read by Display/Alarm tasks)
 volatile bool     upgradePending = false;  // a newer version was announced
 volatile uint32_t targetVersion  = 0;      // that newer version, as a number
+
+// OTA state (written by Network task, read by Display/Alarm tasks)
+volatile bool     otaWindowOpen = false;   // waiting for an upload
+volatile bool     otaRunning    = false;   // upload in progress
+volatile uint8_t  otaPercent    = 0;
+volatile uint32_t otaWindowLeftS = 0;
+uint32_t          otaHandledFor  = 0;      // version we already opened a window for
 
 RTC_DATA_ATTR uint32_t bootCount = 0;
 
@@ -199,6 +209,8 @@ void alarmTask(void* param) {
             digitalWrite(BUZZER_PIN, BUZZER_ON);
             vTaskDelay(pdMS_TO_TICKS(150));
             digitalWrite(BUZZER_PIN, BUZZER_OFF);
+        } else if (otaRunning) {
+            setColor(0, 1, 1);                        // cyan  = installing update
         } else if (upgradePending) {
             setColor(1, 0, 1);                        // purple = update available
         } else {
@@ -239,6 +251,10 @@ void displayTask(void* param) {
         oled.setCursor(0, 56);
         if (data.alarm) {
             oled.printf("Boot:%lu  ALARM!", bootCount);
+        } else if (otaRunning) {
+            oled.printf("OTA installing %u%%", otaPercent);
+        } else if (otaWindowOpen) {
+            oled.printf("OTA open %lus", otaWindowLeftS);
         } else if (upgradePending) {
             char t[12];
             versionToText(targetVersion, t, sizeof(t));
@@ -291,8 +307,9 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
         LOG_INFO("UPGRADE ACCEPTED: %s -> %s", cur, text);
         upgradePending = true;
         targetVersion  = announced;
+        otaHandledFor  = 0;                   // publishing again re-opens the window
         publishOtaResult("upgrade_accepted", text);
-        // Step 8: open the OTA window here
+        // The Network task sees upgradePending and opens the OTA window
     } else if (announced == FW_VERSION) {
         LOG_INFO("Already up to date (%s)", cur);
         upgradePending = false;
@@ -347,6 +364,43 @@ void publishTelemetry(const SensorData_t& d) {
     else                                       LOG_WARN("Publish failed: %s", TOPIC_TELEMETRY);
 }
 
+// ─── OTA (ArduinoOTA) ────────────────────────────────────────────────────
+// Set up once. The window is opened with ArduinoOTA.begin() only after an
+// upgrade is accepted, and closed again with ArduinoOTA.end() after 2 minutes.
+void otaSetup() {
+    ArduinoOTA.setHostname(OTA_HOSTNAME);     // shows in Arduino IDE as a network port
+    ArduinoOTA.setPassword(OTA_PASS);         // IDE asks for this before uploading
+
+    ArduinoOTA.onStart([]() {
+        otaRunning = true;
+        otaPercent = 0;
+        LOG_INFO("OTA upload STARTED");
+        mqtt.publish(TOPIC_OTA, "{\"result\":\"ota_started\"}");
+    });
+    ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+        uint8_t p = (uint8_t)(done * 100 / total);
+        if (p / 10 != otaPercent / 10) LOG_INFO("OTA progress %u%%", p);   // log every 10 %
+        otaPercent = p;
+    });
+    ArduinoOTA.onEnd([]() {
+        LOG_INFO("OTA upload FINISHED - rebooting into the new firmware");
+        mqtt.publish(TOPIC_OTA, "{\"result\":\"ota_success_rebooting\"}");
+        mqtt.disconnect();                    // clean goodbye before reboot
+    });
+    ArduinoOTA.onError([](ota_error_t err) {
+        otaRunning = false;
+        const char* why = err == OTA_AUTH_ERROR    ? "auth failed (wrong OTA password)" :
+                          err == OTA_BEGIN_ERROR   ? "begin failed (sketch too big?)"    :
+                          err == OTA_CONNECT_ERROR ? "connect failed"                    :
+                          err == OTA_RECEIVE_ERROR ? "receive failed"                    :
+                          err == OTA_END_ERROR     ? "end failed"                        : "unknown";
+        LOG_ERROR("OTA error: %s", why);
+        char msg[96];
+        snprintf(msg, sizeof(msg), "{\"result\":\"ota_error\",\"reason\":\"%s\"}", why);
+        mqtt.publish(TOPIC_OTA, msg);
+    });
+}
+
 // ═════════════════════════════════════════════════════════════════════════
 // TASK 4: NETWORK  (core 0, priority 2)
 // WiFi + MQTT live here so a slow network never blocks the core-1 tasks.
@@ -377,6 +431,9 @@ void networkTask(void* param) {
     mqtt.setCallback(onMqttMessage);
     mqtt.setBufferSize(512);
     mqtt.setKeepAlive(30);
+
+    otaSetup();
+    uint32_t otaOpenedAt   = 0;
 
     uint32_t lastPublish = 0;
     uint32_t lastAttempt = 0;
@@ -429,7 +486,34 @@ void networkTask(void* param) {
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(50));
+        // ---- OTA window ----
+        // Open it once for each newly accepted version
+        if (upgradePending && !otaWindowOpen && targetVersion != otaHandledFor) {
+            otaHandledFor = targetVersion;
+            ArduinoOTA.begin();
+            otaWindowOpen = true;
+            otaOpenedAt   = millis();
+            char t[12];
+            versionToText(targetVersion, t, sizeof(t));
+            LOG_INFO("OTA WINDOW OPEN for %d s | host %s.local | IP %s | waiting for v%s",
+                     OTA_WINDOW_MS / 1000, OTA_HOSTNAME, WiFi.localIP().toString().c_str(), t);
+            mqtt.publish(TOPIC_OTA, "{\"result\":\"ota_window_open\"}");
+        }
+
+        if (otaWindowOpen) {
+            ArduinoOTA.handle();              // receives the upload (blocks while uploading)
+            uint32_t elapsed = millis() - otaOpenedAt;
+            otaWindowLeftS = elapsed < OTA_WINDOW_MS ? (OTA_WINDOW_MS - elapsed) / 1000 : 0;
+
+            if (!otaRunning && elapsed >= OTA_WINDOW_MS) {
+                ArduinoOTA.end();
+                otaWindowOpen = false;
+                LOG_WARN("OTA window closed: no upload received");
+                mqtt.publish(TOPIC_OTA, "{\"result\":\"ota_window_closed\"}");
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(otaWindowOpen ? 10 : 50));
     }
 }
 
@@ -445,7 +529,8 @@ void setup() {
     LOG_INFO("Firmware v%d.%d.%d (0x%06lX) | Boot #%lu",
              FW_MAJOR, FW_MINOR, FW_PATCH, FW_VERSION, bootCount);
     LOG_INFO("Chip: %s | IDF: %s", ESP.getChipModel(), esp_get_idf_version());
-
+    
+    pinMode(BUZZER_PIN, OUTPUT)
     digitalWrite(BUZZER_PIN, BUZZER_OFF);
     pinMode(BUZZER_PIN, OUTPUT);
     pinMode(LED_R, OUTPUT);
@@ -465,7 +550,6 @@ void setup() {
 
     dht.begin();
 
-    // Unique MQTT client ID from the chip's MAC address
     uint64_t mac = ESP.getEfuseMac();
     snprintf(clientId, sizeof(clientId), "fleetforge-%04X%08lX",
              (uint16_t)(mac >> 32), (uint32_t)mac);
@@ -474,7 +558,6 @@ void setup() {
     displayQueue = xQueueCreate(1, sizeof(SensorData_t));
     mqttQueue    = xQueueCreate(1, sizeof(SensorData_t));
 
-    //                     function     name           stack  param prio handle core
     xTaskCreatePinnedToCore(sensorTask,  "SensorTask",   4096, NULL, 3, NULL, 1);
     xTaskCreatePinnedToCore(alarmTask,   "AlarmTask",    4096, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(displayTask, "DisplayTask",  4096, NULL, 1, NULL, 1);
@@ -482,7 +565,6 @@ void setup() {
 
     LOG_INFO("All 4 tasks created");
 }
-
 void loop() {
     vTaskDelete(NULL);
 }
