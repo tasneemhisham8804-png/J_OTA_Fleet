@@ -1,4 +1,5 @@
 // Project J - OTA Server + Fleet Management (Team FleetForge)
+// Step 9: deep sleep - timer wake, OTA window after each wake
 // Step 8: OTA - an accepted upgrade opens a 2-minute ArduinoOTA window
 // Step 7: Fleet version check - accept upgrades, reject downgrades
 // (Step 5 base: WiFiManager + secure MQTT (TLS) to EMQX Cloud)
@@ -42,6 +43,10 @@ const uint32_t FW_VERSION = (FW_MAJOR << 16) | (FW_MINOR << 8) | FW_PATCH;
 #define NODE_ID          "node01"
 #define OTA_WINDOW_MS    120000         // OTA window stays open 2 minutes
 #define OTA_HOSTNAME     "fleetforge-" NODE_ID
+#define SLEEP_SECONDS   60       // timer wake, allowed range 30..300
+#define FLEET_WAIT_MS   4000     // after MQTT connects, wait for the retained fleet version
+#define AWAKE_MAX_MS    120000   // failsafe: sleep anyway if MQTT never comes up
+// #define DEMO_NO_SLEEP         // uncomment for the live demo: stay awake
 
 // ─── MQTT TOPICS ─────────────────────────────────────────────────────────
 // ois/fleetforge/node01/telemetry   temperature, humidity, boot count ...
@@ -401,6 +406,21 @@ void otaSetup() {
     });
 }
 
+void goToSleep() {
+    LOG_INFO("Going to deep sleep for %d s (boot #%lu)", SLEEP_SECONDS, bootCount);
+    if (mqtt.connected()) {
+        mqtt.publish(TOPIC_STATUS, "sleeping", true);   // clean exit, so the Last Will does not fire
+        mqtt.loop();
+        delay(100);
+        mqtt.disconnect();
+    }
+    if (oledOk) { oled.clearDisplay(); oled.display(); }
+    setColor(0, 0, 0);
+    digitalWrite(BUZZER_PIN, BUZZER_OFF);
+    esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_SECONDS * 1000000ULL);
+    esp_deep_sleep_start();
+}
+
 // ═════════════════════════════════════════════════════════════════════════
 // TASK 4: NETWORK  (core 0, priority 2)
 // WiFi + MQTT live here so a slow network never blocks the core-1 tasks.
@@ -434,6 +454,8 @@ void networkTask(void* param) {
 
     otaSetup();
     uint32_t otaOpenedAt   = 0;
+    uint32_t mqttUpAt = 0;     // when MQTT connected this wake
+    bool     sentOnce = false; // telemetry already sent this wake
 
     uint32_t lastPublish = 0;
     uint32_t lastAttempt = 0;
@@ -458,6 +480,7 @@ void networkTask(void* param) {
             if (millis() - lastAttempt > 5000) {
                 lastAttempt = millis();
                 mqttOk = mqttConnect();
+                if (mqttOk) mqttUpAt = millis();
             }
         } else {
             mqttOk = true;
@@ -479,10 +502,11 @@ void networkTask(void* param) {
                 lastAlarm = latest.alarm;
             }
 
-            // Regular telemetry every 10 s
-            if (millis() - lastPublish >= PUBLISH_EVERY_MS) {
+            // Send right after wake, then every 10 s
+            if (!sentOnce || millis() - lastPublish >= PUBLISH_EVERY_MS) {
                 lastPublish = millis();
                 publishTelemetry(latest);
+                sentOnce = true;
             }
         }
 
@@ -513,6 +537,22 @@ void networkTask(void* param) {
             }
         }
 
+#ifndef DEMO_NO_SLEEP
+        bool otaBusy = otaWindowOpen || otaRunning ||
+                       (upgradePending && otaHandledFor != targetVersion);   // window about to open
+        bool fleetChecked = mqttOk && (millis() - mqttUpAt > FLEET_WAIT_MS);
+
+        static uint32_t lastDbg = 0;                                         // debug: why not sleeping?
+        if (millis() - lastDbg > 5000) {
+            lastDbg = millis();
+            LOG_INFO("sleep check: sent=%d mqtt=%d fleetWait=%d busy=%d",
+                     sentOnce, mqttOk, (int)(millis() - mqttUpAt > FLEET_WAIT_MS), otaBusy);
+        }
+
+        if (sentOnce && fleetChecked && !otaBusy) goToSleep();
+        if (!mqttOk && !otaBusy && millis() > AWAKE_MAX_MS) goToSleep();     // failsafe
+#endif
+
         vTaskDelay(pdMS_TO_TICKS(otaWindowOpen ? 10 : 50));
     }
 }
@@ -529,10 +569,9 @@ void setup() {
     LOG_INFO("Firmware v%d.%d.%d (0x%06lX) | Boot #%lu",
              FW_MAJOR, FW_MINOR, FW_PATCH, FW_VERSION, bootCount);
     LOG_INFO("Chip: %s | IDF: %s", ESP.getChipModel(), esp_get_idf_version());
-    
-    pinMode(BUZZER_PIN, OUTPUT)
-    digitalWrite(BUZZER_PIN, BUZZER_OFF);
+
     pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, BUZZER_OFF);
     pinMode(LED_R, OUTPUT);
     pinMode(LED_G, OUTPUT);
     pinMode(LED_B, OUTPUT);
@@ -565,6 +604,7 @@ void setup() {
 
     LOG_INFO("All 4 tasks created");
 }
+
 void loop() {
     vTaskDelete(NULL);
 }
